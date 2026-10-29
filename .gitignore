@@ -1,0 +1,6 @@
+# large or generated: kept only locally
+examples/
+cache/
+out/
+*.glb
+__pycache__/
