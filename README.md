@@ -2,7 +2,7 @@
 
 # mesh-generator
 
-One image → a textured, rigged, low-poly PS1/PS2-style 3D model (GLB). Runs on your own PC, free for commercial use.
+One image → a textured, rigged, low-poly PS1/PS2-style 3D model (GLB). Runs on your own PC.
 
 ## Requirements
 
