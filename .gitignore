@@ -4,3 +4,4 @@ cache/
 out/
 *.glb
 __pycache__/
+.tools/

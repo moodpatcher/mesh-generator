@@ -45,6 +45,9 @@ In the output folder:
 
 ## Requirements
 
+**Setting it up: see `install.md`** (`setup.ps1` checks the environment read-only; every install step is opt-in, and
+you ask the user before running any of them – the rules for that are at the end of `install.md`).
+
 ### A) With Docker (recommended, tested)
 
 - **Windows 10/11 + Docker Desktop** (WSL2 backend), or **Linux + Docker** + the NVIDIA Container Toolkit.
@@ -116,7 +119,7 @@ If this works, the kit works. Compare `out/james/check/sheet-*.png` with `exampl
 
 ## Demos
 
-The sheets of the best runs are in `docs/images/` (shown in `README.md`). The full runs are in `examples/`
+The full runs are in `examples/`
 (local copy only). These are real runs on an RTX 3060 (12 GB VRAM, so TRELLIS.2 ran its 512 mode), Docker, Blender 4.5.15.
 Each has `source.png` and `result/` with:
 - `model.glb`, `hires.glb` and `check/sheet-*.png`;
@@ -139,7 +142,7 @@ it, a new generation gives a similar result.
 |---|---|---|
 | `--kind` | `object` / `character` / `creature` | characters / creatures get a closed mesh (see "The steps"); the default height differs |
 | `--triangles` | PS1 prop 300–800 (500), PS1 character ~1000, PS2 2000–5000 (3000) | default: object 500, character 1000 |
-| `--texture` | 64 / 128 / 256 / 512 | PS1: 64–256, PS2: 256–512; default 128 |
+| `--texture` | 64 / 128 / 256 / 512 / 1024 / 2048 | PS1: 64–256, PS2: 256–512; **2048 is about the resolution of a reference photo** (869 px/m on a 1.75 m figure; the engine downsizes it per preset); default 128. `generate.ps1` uses 2048 + 4000 triangles (character), or 128 + 1000 with `-Ps1` |
 | `--height` | meters | the real height (bottle 0.3, chair 0.9, door 2.1); 0 = object 1.0, character 1.75, creature 1.6 |
 | `--ps1` | – | 15-bit color with a 4×4 dither on the atlas (the PS1 look) |
 | `--remesh` | – | always carve a closed solid before the decimation (for holey, open meshes; automatic for characters) |
@@ -148,6 +151,10 @@ it, a new generation gives a similar result.
 | `--seed` | 42 | the TRELLIS.2 random seed (even the same seed is not bit-exact on the GPU) |
 | `--hires` | GLB | an existing high-res mesh: the generation is skipped |
 | `--close` | e.g. `0.5,0.72,0.9` | heights of the close-ups (fractions); the default for characters (hips, shoulders, head) |
+| `--project` / `--no-project` | – | the front of the reference photo is projected onto the atlas (aligned, unoccluded, color matched); default: on for character / creature, off for object (its reference is a three-quarter view) |
+| `--flat` | – | flat shading (faceted, the PS1 look). Default: smooth by angle (55°), so the round parts are not faceted in an engine with lights |
+| `--rig` / `--no-rig` | – | humanoid skeleton + skin weights + `idle-loop` / `walk-loop` clips → `model_rigged.glb` (default: on for `--kind character`, `model.glb` stays the static model) |
+| `--bone-names` | `mixamo` / `godot` | `mixamorig:Hips …` (default) or Godot `SkeletonProfileHumanoid` names (`Hips, Spine, Chest, UpperChest, LeftUpperArm …`) |
 | `--mode` / `--gen-mode` | `auto` / `docker` / `local` | see "Requirements" |
 | `--cache` | folder | where the weights are kept (default `cache/`) |
 
@@ -175,7 +182,12 @@ with it.
 - For a figure in dark clothes the runner puts a gray background behind the image by itself; on black, TRELLIS.2
   would build a box.
 
-**Prompts, if the user generates the image themselves.** These are the ones nldp uses; replace `[…]` with the
+**Prompts, if the user generates the image themselves:** `prompt.ps1 -Kind character|creature|object -Description "…"`
+makes them (and copies to the clipboard). It makes the FRONT prompt (ONE figure: this is the picture for the pipeline),
+then asks y/n whether the user also wants the sides and the back: a second prompt, the same character from all four
+directions (front, right, back, left) as four separate figures in one picture. That four-direction picture is NOT given
+to the pipeline (it would be read as several objects); it is a reference for the back and the sides, and is not wired
+into the pipeline yet. The text below is the same idea in short form; replace `[…]` with the
 description.
 
 - **Character:**
@@ -222,8 +234,29 @@ description.
    - **Low-poly:** Collapse decimation (QEM) to the budget. If it stalls, or for a character whose mesh is open or
      double-layered, it first **carves a solid** around the mesh (voxel grid flooded from outside, Voxel Remesh)
      and decimates that. The result is a closed, one-piece mesh.
-   - **UV and bake:** Smart UV Project, then a Cycles bake (Emit, selected-to-active): the color of the high-res
-     mesh goes onto the atlas, without shadows; the material is matte.
+   - **The face budget:** the carving grid is 5.5 mm (320 divisions) for budgets up to 6000 (it was 9 mm: the nose
+     flattened and the hair strands merged), and the decimation resists collapsing in the head (vertex group, weight
+     0.5): about 44% of the triangles are the head's. `post.head_triangles` has the number. Do not tune the weights
+     to one model; a better face needs a better generated head (see "Faults").
+   - **UV and bake:**
+     - head and body are unwrapped separately (Smart UV Project, no island crosses the neck); every island gets the
+       same texel density, the head islands 1.6× the length (2.6× the texels), then a tight pack;
+     - a Cycles bake (Emit, selected-to-active): the color of the high-res mesh goes onto the atlas, without
+       shadows; the material is matte.
+   - **Texture from the photo (character / creature, `--project`):**
+     - the generator's colors are soft and shifted; the sharp reference is projected onto every front-facing,
+       unoccluded texel (a depth map of the front) and blended in by how directly it faces;
+     - head, upper body and legs are aligned to the photo separately (offset + scale search, correlation with the
+       baked colors), then a local flow field (cells of about 2.5 cm, up to ±1.2 cm) moves the photo where the
+       shapes differ;
+     - a consistency gate on the **head only**: a large area of the photo whose color is far from the generator's
+       there (the photo's hair landing on the mesh's cheek) is not used. It is smoothed over the atlas. On the body
+       it was measured to eat the dark straps and hems (ragged fringes), so it is off there;
+     - the baked colors elsewhere (sides, back) get a gain per color group (k-means) fitted on the texels where
+       both are known, so a hue shift (blond hair gone red) is corrected everywhere;
+     - texels the bake missed (black holes) are filled from their neighbors; the margin is re-dilated.
+     - `report.json` → `post.texture`: islands, `px_per_m` (body), `head_px_per_m`, `uv_area_used`, `fit`
+       (offset in m, scale, correlation), `gain`, `bake_holes`.
    - **Orientation:** of the four side views, the one matching the reference outline best becomes the front.
    - **PS1 (if asked):** reduces the atlas to 15-bit color.
    - **Export:** GLB.
@@ -321,14 +354,58 @@ check can also be done live:
 The pipeline itself does not need it: `pipeline.py` runs a headless Blender. Through MCP, do **not** edit the mesh by
 hand or tune the code to a single model. The fix is a better reference, or other settings with `--hires`.
 
-## Animation
+## AI edits through Blender MCP (optional, `ai.ps1`)
 
-`model.glb` is static, a single mesh.
+After a run, `generate.ps1` asks "Do you want to make AI edits to the model through Blender MCP? [y/N]", then which
+agent (Claude Code or Codex). `ai.ps1 out\<name>` does the same later. What it does:
 
-- To animate it, add an armature in Blender and bind it with automatic weights (Armature → With Automatic
-  Weights), then animate.
-- The A-pose reference is what makes this work: the arms stand away from the body.
-- nldp's own skinning and walk generator are not part of this kit.
+- opens a Blender window (the host's Blender, `--factory-startup`, nothing installed into it) with the model and the
+  add-on of **ahujasid/mcp-for-blender** (MIT) loaded from a file, listening on localhost only;
+- runs the MCP server of that project in Docker (`docker/blender-mcp.Dockerfile`, version pinned, telemetry off);
+- starts the agent with only that MCP server; the user types prompts and gives picture paths ("put THIS on her
+  face"); the agent edits the atlas in place and saves `model_ai.glb` + `model_ai.blend` next to the model.
+
+Rules:
+- **This step sends the user's prompts, pictures and what the agent sees in Blender to its provider** (Anthropic /
+  OpenAI). Never start it without the user's yes. The generation itself stays local.
+- Online services: **Poly Haven only** (free, CC0). Every other service of the add-on (Hyper3D, Hunyuan3D, Sketchfab,
+  Tripo, Meshy, Poly Pizza) is switched off and has no key; with Claude Code `generate_3d`,
+  `record_trajectory_feedback` and `disable_telemetry` are also denied. **Never Hunyuan3D** (rule 2).
+- The add-on's socket has no authentication (upstream says so): it listens on localhost and exists only while the
+  session runs.
+- `ai.ps1 -SelfTest` checks the chain without an agent: Blender window, the MCP server in Docker, the handshake, the
+  tool list and `get_scene_info`. Run it after changing anything here. Tested with Claude Code's flags on the
+  command line; the Codex branch was **not** run (no Codex on the dev machine).
+
+## Rig and animation
+
+`model.glb` is static, a single mesh. For `--kind character` the pipeline also writes `model_rigged.glb`
+(`scripts/blender_rig.py`, after the post step):
+
+- 22 bones, standard humanoid hierarchy (hips, 3 spine, neck, head; per side shoulder, arm, forearm, hand,
+  upleg, leg, foot, toe). No fingers: the hand is one bone.
+- The joints are placed from the mesh itself (torso width, hand tips, leg centers), with body proportions as the
+  fallback. It needs the A-pose reference: arms that touch the torso give wrong shoulders and leaking weights.
+- Weights: Blender's automatic heat weights, at most 4 bones per vertex, normalized. A vertex the solver leaves
+  without weight goes to its nearest bone.
+- Two procedural clips, `idle-loop` and `walk-loop` (30 fps, last frame = first; the `-loop` suffix is what
+  RasterWare loops by). They are placeholders: put your own clips in over them.
+- Same orientation as `model.glb` (Y up, front +Z, soles at 0, meters); the RasterWare player turns it 180° itself.
+- With `--bone-names mixamo` the bone names match Mixamo's, so Mixamo clips can be applied by name (a Blender
+  step for that is not in the kit yet).
+
+`report.json` → `rig` and three more verdicts:
+
+| verdict | ok when | if not |
+|---|---|---|
+| `rig` | 22 bones, 2 clips | a bug – report it |
+| `weights` | 0 unweighted vertices, ≤ 4 influences | a bug – report it |
+| `skin_leak` | 0 vertices of the right side follow a rotated left arm / leg (warn ≤ 20) | arms or legs touch the body in the reference: a better A-pose |
+
+`check/walk.gif` is rendered by the pipeline (`blender_anim.py` + `make_gif.py`): one walk cycle, three-quarter and
+side. Look at it: a bad bone or weight shows there. Also play `walk-loop` in the engine.
+Not tested yet: the Docker Blender 4.5.15 (the rig was run with Blender 5.2 only), and a character that is not a
+standing biped (`--kind creature` has no rig).
 
 ## Licenses
 
@@ -346,13 +423,20 @@ hand or tune the code to a single model. The fix is a better reference, or other
 ```
 CLAUDE.md                 this guide
 README.md                 a short summary for people
+ai.cmd / ai.ps1           the optional AI-edit step: a Blender window + an agent (Claude Code / Codex) through Blender MCP; scripts/ai_blender.py, scripts/ai-session-prompt.txt, docker/blender-mcp.Dockerfile
+git.ps1                   git without installing git (a small Docker image, docker/git.Dockerfile; only the GitHub SSH key is copied in, for push / pull / fetch)
+stop.cmd / .ps1           stops the pipeline and every kep3d-* container (pipeline.py also kills its containers when it exits, on Ctrl+C and when the console window is closed)
+install.md, setup.ps1     the environment: what to install, a read-only check, opt-in setup (portable Python, images, WSL memory)
+generate.cmd / .ps1       Windows: drag an image onto generate.cmd -> pipeline into out\<name>\, verdicts, pictures opened
+prompt.cmd / .ps1         the prompt for the image model (character / creature / object), copied to the clipboard
 scripts/pipeline.py       the whole run (standard library only)
 scripts/key.py            background removal (Pillow + numpy)
 scripts/trellis2_runner.py, triposr_runner.py   the generation, in the container / your own environment
 scripts/blender_post.py   post-processing (Blender)
+scripts/blender_rig.py    skeleton, skin weights, idle / walk clips -> model_rigged.glb (Blender)
 scripts/blender_check.py  measurements + renders + sheets (Blender)
 docker/*.Dockerfile       trellis2, triposr, blender (4.5.15), tools (Pillow + numpy)
-docs/images/              sheets of the best demo runs (README)
+docs/images/header.png    the one picture of the README
 examples/james/           source + a ready hires.glb + the expected result (expected/) – local copy only
 examples/*/               demo runs: source.png + result/ (model.glb, hires.glb, check/, report.json) – local only
 cache/                    the model weights (created on the first generation)

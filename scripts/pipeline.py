@@ -20,10 +20,13 @@ Repeatability: TRELLIS.2 is not bit-exact on the GPU (two runs: cm-level differe
 places). The exact same result comes from the saved hires.glb: --hires <folder>/hires.glb + the same settings."""
 
 import argparse
+import atexit
 import hashlib
+import itertools
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -37,6 +40,7 @@ IMAGES = {  # tag, Dockerfile, existing images with the same content (e.g. nldp'
     "triposr": ("kep3d-triposr:1", "triposr.Dockerfile", ["nldp-triposr:1"]),
     "blender": ("kep3d-blender:4.5.15", "blender.Dockerfile", ["nldp-blender:4.5.15"]),
     "tools": ("kep3d-tools:1", "tools.Dockerfile", []),
+    "blender-mcp": ("kep3d-blender-mcp:2.2.1", "blender-mcp.Dockerfile", []),
 }
 HEIGHT = {"object": 1.0, "character": 1.75, "creature": 1.6}
 TRIANGLES = {"object": 500, "character": 1000, "creature": 1000}
@@ -45,6 +49,55 @@ FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 class Fail(RuntimeError):
     pass
+
+
+# --- containers die with this process --------------------------------------------------------------------------------
+# `docker run --rm` keeps running when its client dies (the window is closed, Ctrl+C): the container goes on generating
+# for minutes with nobody to take the result, holding the GPU and 16 GB of memory. So every container gets a name, and
+# on exit, Ctrl+C, SIGTERM and closing the console window the ones still running are killed.
+
+ACTIVE = set()
+_COUNTER = itertools.count(1)
+_HANDLER = None  # keeps the ctypes callback alive
+
+
+def named(cmd):
+    """A `docker run --rm ...` command with a --name, remembered in ACTIVE (other commands are returned as they are)."""
+    if len(cmd) > 3 and Path(str(cmd[0])).stem.lower() == "docker" and cmd[1] == "run" and cmd[2] == "--rm":
+        name = f"kep3d-{os.getpid()}-{next(_COUNTER)}"
+        ACTIVE.add(name)
+        return list(cmd[:3]) + ["--name", name] + list(cmd[3:])
+    return cmd
+
+
+def kill_active(*_):
+    d = docker_exe() or "docker"
+    for name in list(ACTIVE):
+        try:
+            subprocess.run([d, "kill", name], capture_output=True, timeout=20, creationflags=FLAGS)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        ACTIVE.discard(name)
+
+
+def install_cleanup():
+    global _HANDLER
+    atexit.register(kill_active)
+
+    def on_signal(sig, frame):
+        kill_active()
+        raise SystemExit(130)
+
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(s, on_signal)
+        except (ValueError, OSError):
+            pass
+    if os.name == "nt":  # closing the console window is not a signal Python sees: the console control handler is
+        import ctypes
+        _HANDLER = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)(lambda ev: (kill_active() if ev in (0, 1, 2, 5, 6)
+                                                                                 else None, 0)[1])
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_HANDLER, True)
 
 
 def log(step, text):
@@ -133,7 +186,7 @@ def ensure_image(d, key, build_args=()):
 
 def stream(cmd, step, timeout, env=None, cwd=None):
     """The running command's output: the runners' JSON lines ({step, progress, text} / {error} / {done}) readably."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+    proc = subprocess.Popen(named(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", env=env, cwd=cwd, creationflags=FLAGS)
     tail, last, t0 = [], {}, time.monotonic()
     for line in proc.stdout:
@@ -168,7 +221,7 @@ def step_key(a, out, d):
                f"/work/{src.name}", "/work/reference_keyed.png"]
     else:
         cmd = [a.python, str(SCRIPTS / "key.py"), str(src), str(out / "reference_keyed.png")]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=FLAGS)
+    r = subprocess.run(named(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=FLAGS)
     if r.returncode != 0:
         raise Fail("key failed (local mode needs Pillow + numpy: pip install pillow numpy):\n" + (r.stderr or r.stdout)[-1500:])
     log("key", "reference_keyed.png")
@@ -251,7 +304,7 @@ def blender(a, out, d, script, task, timeout=1800):
                str(out / f"{name}.json")]
     res_file = out / f"{name}.json.out.json"
     res_file.unlink(missing_ok=True)
-    r = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=FLAGS)
+    r = subprocess.run(named(cmd), capture_output=True, timeout=timeout, creationflags=FLAGS)
     if not res_file.exists():
         tail = (r.stderr or r.stdout or b"").decode("utf-8", "replace")[-1500:]
         raise Fail(f"Blender ({script}) failed (exit {r.returncode}):\n{tail}")
@@ -263,6 +316,32 @@ def blender(a, out, d, script, task, timeout=1800):
 
 def md5(path):
     return hashlib.md5(Path(path).read_bytes()).hexdigest()
+
+
+def step_gif(a, out, d, mode, clip="walk-loop", frames=30):
+    """check/walk.gif: the rigged model walking in place (three-quarter + side), so a bad bone or weight shows."""
+    res = blender(a, out, d, "blender_anim.py",
+                  {"glb": "model_rigged.glb", "out": "check/anim", "clip": clip, "frames": frames, "size": [400, 560]})
+    fps = frames / max(res.get("clip_seconds") or 1.0, 0.1)
+    if mode == "docker":
+        tag = ensure_image(d, "tools")
+        cmd = [d, "run", "--rm", "-v", f"{out}:/work", "-v", f"{SCRIPTS}:/s:ro", tag, "python", "/s/make_gif.py",
+               "/work/check/anim", "/work/check/walk.gif", f"{fps:.2f}"]
+    else:
+        cmd = [a.python, str(SCRIPTS / "make_gif.py"), str(out / "check" / "anim"), str(out / "check" / "walk.gif"),
+               f"{fps:.2f}"]
+    r = subprocess.run(named(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=FLAGS)
+    shutil.rmtree(out / "check" / "anim", ignore_errors=True)
+    if r.returncode != 0:
+        raise Fail("walk.gif failed (local mode needs Pillow: pip install pillow):\n" + (r.stderr or r.stdout)[-1500:])
+    return {"gif": "check/walk.gif", "clip": clip, "frames": frames}
+
+
+def rig_verdicts(rg):
+    """The skeleton, the skin weights and the pose test (see "Rig" in CLAUDE.md)."""
+    return {"rig": "ok" if rg["bones"] == 22 and len(rg["clips"]) >= 2 else "fail",
+            "weights": "ok" if rg["unweighted"] == 0 and rg["max_influences"] <= 4 else "fail",
+            "skin_leak": "ok" if rg["leak_vertices"] == 0 else ("warn" if rg["leak_vertices"] <= 20 else "fail")}
 
 
 def verdicts(a, height, post, chk):
@@ -284,13 +363,36 @@ def verdicts(a, height, post, chk):
     return v
 
 
+def setup(names):
+    """pipeline.py --setup [tools blender triposr trellis2]: build the Docker images now (they also build themselves on
+    first use). Default: tools + blender (small)."""
+    d = docker_exe()
+    if not d or not docker_running(d):
+        raise SystemExit("ERROR: Docker is not running - start Docker Desktop")
+    caps = sorted({x["cap"] for x in gpus()})
+    for key in names or ["tools", "blender"]:
+        if key not in IMAGES:
+            raise SystemExit(f"ERROR: unknown image '{key}' (choose from {', '.join(IMAGES)})")
+        build = []
+        if key in ("trellis2", "triposr"):
+            build = ([f"CUDA_ARCHS={';'.join(caps)}"] if caps else []) + ["MAX_JOBS=4"]
+        try:
+            log("setup", f"{key}: {ensure_image(d, key, build)} ready")
+        except Fail as e:
+            raise SystemExit(f"ERROR: {e}")
+
+
 def main():
+    install_cleanup()
+    if len(sys.argv) > 1 and sys.argv[1] == "--setup":
+        return setup(sys.argv[2:])
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("image", help="the source image (PNG/JPG; transparent, magenta or plain single-color background)")
     p.add_argument("out", help="output folder (created)")
     p.add_argument("--kind", choices=("object", "character", "creature"), default="object")
     p.add_argument("--triangles", type=int, help="budget: PS1 prop 300-800, PS1 character ~1000, PS2 2000-5000")
-    p.add_argument("--texture", type=int, choices=(64, 128, 256, 512), default=128, help="atlas size (px)")
+    p.add_argument("--texture", type=int, choices=(64, 128, 256, 512, 1024, 2048), default=128,
+                   help="atlas size (px); 2048 is about the resolution of a reference photo")
     p.add_argument("--height", type=float, default=0.0, help="real height in m (0: object 1.0, character 1.75, "
                                                               "creature 1.6)")
     p.add_argument("--ps1", action="store_true", help="15-bit color with 4x4 dither on the atlas")
@@ -310,8 +412,23 @@ def main():
     p.add_argument("--cache", default=str(KIT / "cache"), help="model weights cache (Docker mode, downloaded once)")
     p.add_argument("--close", default="", help="close-up heights as fractions, e.g. 0.5,0.72,0.9 "
                                                "(default: character 0.5,0.72,0.9; object none)")
+    p.add_argument("--rig", action=argparse.BooleanOptionalAction, default=None,
+                   help="humanoid skeleton + skin weights + idle-loop / walk-loop clips -> model_rigged.glb "
+                        "(default: on for --kind character)")
+    p.add_argument("--project", action=argparse.BooleanOptionalAction, default=None,
+                   help="project the front of the reference photo onto the atlas, aligned and color matched "
+                        "(default: on for character / creature, whose reference is a front view)")
+    p.add_argument("--flat", action="store_true", help="flat shading (faceted, the PS1 look); default: smooth by angle")
+    p.add_argument("--bone-names", choices=("mixamo", "godot"), default="mixamo",
+                   help="bone naming: mixamo (mixamorig:Hips ...) or godot (SkeletonProfileHumanoid)")
     p.add_argument("--skip-check", action="store_true")
     a = p.parse_args()
+    if a.project is None:
+        a.project = a.kind != "object"
+    if a.rig is None:
+        a.rig = a.kind == "character"
+    if a.rig and a.kind == "object":
+        raise SystemExit("ERROR: --rig is for humanoid characters (--kind character)")
 
     a.triangles = a.triangles or TRIANGLES[a.kind]
     height = a.height if a.height > 0 else HEIGHT[a.kind]
@@ -348,12 +465,22 @@ def main():
         post = blender(a, out, d, "blender_post.py",
                        {"op": "image3d", "glb": "hires.glb", "out": "model.glb", "triangles": a.triangles,
                         "texture": a.texture, "height": height, "remesh": a.remesh, "manifold": a.kind != "object",
-                        "reference": "reference_keyed.png", "ps1": a.ps1})
+                        "reference": "reference_keyed.png", "ps1": a.ps1, "project": a.project, "flat": a.flat})
         post.pop("ok", None)
         post.pop("out", None)
         report["post"] = post
         report["model_md5"] = md5(out / "model.glb")
         log("post", f"model.glb: {post['triangles']} triangles, carved={post['remeshed']}, front={post['front_view']}")
+        if a.rig:
+            log("rig", f"Blender ({a.blender_mode}): skeleton, weights, clips ({a.bone_names} names)")
+            rg = blender(a, out, d, "blender_rig.py",
+                         {"op": "rig", "glb": "model.glb", "out": "model_rigged.glb", "names": a.bone_names})
+            rg.pop("ok", None)
+            rg.pop("out", None)
+            report["rig"] = rg
+            log("rig", f"model_rigged.glb: {rg['bones']} bones, unweighted {rg['unweighted']}, max influences "
+                       f"{rg['max_influences']}, leaks {rg['leak_vertices']}, clips "
+                       + ", ".join(c["name"] for c in rg["clips"]))
         if not a.skip_check:
             log("check", "measuring + rendering")
             shutil.rmtree(out / "check", ignore_errors=True)
@@ -365,6 +492,12 @@ def main():
             chk["sheets"] = [str(out / "check" / Path(x).name) for x in chk["sheets"]]
             report["check"] = chk
             report["verdicts"] = verdicts(a, height, post, chk)
+            if a.rig:
+                log("anim", "rendering the walk cycle -> check/walk.gif")
+                report["animation"] = step_gif(a, out, d if mode == "docker" else None, mode)
+                log("anim", "check/walk.gif")
+        if a.rig:
+            report.setdefault("verdicts", {}).update(rig_verdicts(report["rig"]))
     except Fail as e:
         report["error"] = str(e)
         (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
