@@ -19,6 +19,10 @@ python scripts/pipeline.py image.png out --kind character --triangles 3000 --tex
   again);
 - `out/report.json`, with every setting, measurement and ok / warn / fail verdict.
 
+**No image yet?** [prompt.txt](prompt.txt) is a ready prompt for an image model (gpt-image, Flux, SDXL, …) that
+makes a character image the way this kit needs it: front view, A-pose, flat light, plain background. The whole
+texture of the model is baked from that picture.
+
 ## With Claude Code
 
 Open this folder in Claude Code and ask, for example: *"make a PS2 character from this image: C:\…\image.png"*.
