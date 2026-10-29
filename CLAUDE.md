@@ -187,7 +187,9 @@ makes them (and copies to the clipboard). It makes the FRONT prompt (ONE figure:
 then asks y/n whether the user also wants the sides and the back: a second prompt, the same character from all four
 directions (front, right, back, left) as four separate figures in one picture. That four-direction picture is NOT given
 to the pipeline (it would be read as several objects); it is a reference for the back and the sides, and is not wired
-into the pipeline yet. The text below is the same idea in short form; replace `[…]` with the
+into the pipeline yet. A third y/n question offers TEXTURE prompts for the AI edits (`ai.cmd`): FACE (a front close-up
+with the hair kept off the face, so no strand is projected onto the cheeks), HAIR (the head from behind) and MATERIALS
+(a sheet of seamless swatches). They are what the user gives the AI agent ("put this on the face"), not pipeline input. The text below is the same idea in short form; replace `[…]` with the
 description.
 
 - **Character:**

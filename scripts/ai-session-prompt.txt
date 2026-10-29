@@ -21,6 +21,11 @@ HOW TO WORK
   direction onto the atlas texels that face that direction and are not hidden by another part (the texel -> 3D
   position map can be built from the UVs; Blender's texture-paint projection is another way), feather the edge, and
   write the result into the atlas pixels. A projection smears on surfaces that are steep to the view: check the sides.
+- The user may give you texture pictures made for this job (prompt.ps1): a FACE picture (a front close-up with the hair
+  kept off the face) - project it onto the face of the model, aligned to its eyes, nose and mouth, and keep the
+  model's own hairline; a HAIR picture (the head from behind) - use its color and strand pattern on the hair texels,
+  never paint hair over the face; a MATERIALS sheet (seamless swatches) - tile the matching swatch over the texels of
+  that part of the outfit. Keep the model's own detail wherever the picture has none.
 - Image.pixels is bottom-up, and an 8-bit image holds sRGB values: composite in the space the atlas is in, do not
   convert twice.
 - After every change look at the result from several sides and say what you saw, including faults.
